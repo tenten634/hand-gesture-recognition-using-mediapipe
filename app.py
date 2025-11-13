@@ -4,33 +4,62 @@ import csv
 import copy
 import argparse
 import itertools
+import os
 from collections import Counter
 from collections import deque
-
 import cv2 as cv
 import numpy as np
 import mediapipe as mp
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python import vision as mp_vision
 
 from utils import CvFpsCalc
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
 
 
+def _open_camera(preferred_index: int, use_mac_backend: bool) -> cv.VideoCapture:
+    # Prefer macOS AVFoundation backend first when explicitly requested
+    if use_mac_backend:
+        cap = cv.VideoCapture(preferred_index, cv.CAP_AVFOUNDATION)
+        if not cap.isOpened():
+            cap.release()
+            cap = cv.VideoCapture(preferred_index)
+        if not cap.isOpened() and preferred_index != 0:
+            cap.release()
+            cap = cv.VideoCapture(0, cv.CAP_AVFOUNDATION)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv.VideoCapture(0)
+        return cap
+
+    return cv.VideoCapture(preferred_index)
+
+
 def get_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--device", type=int, default=1)
     parser.add_argument("--width", help='cap width', type=int, default=960)
     parser.add_argument("--height", help='cap height', type=int, default=540)
+    parser.add_argument('--mac', action='store_true',
+                        help='Use macOS AVFoundation camera backend fallback')
+    parser.add_argument("--hand_model_path", type=str,
+                        default="model/hand_landmarker.task",
+                        help="Path to MediaPipe hand landmarker model asset file")
 
     parser.add_argument('--use_static_image_mode', action='store_true')
     parser.add_argument("--min_detection_confidence",
-                        help='min_detection_confidence',
+                        help='Minimum confidence score for palm detection',
                         type=float,
-                        default=0.7)
+                        default=0.5)
+    parser.add_argument("--min_presence_confidence",
+                        help='Minimum confidence score for hand presence',
+                        type=float,
+                        default=0.5)
     parser.add_argument("--min_tracking_confidence",
-                        help='min_tracking_confidence',
-                        type=int,
+                        help='Minimum confidence score for hand tracking',
+                        type=float,
                         default=0.5)
 
     args = parser.parse_args()
@@ -45,26 +74,56 @@ def main():
     cap_device = args.device
     cap_width = args.width
     cap_height = args.height
+    use_mac_backend = args.mac
+    hand_model_path = args.hand_model_path
 
     use_static_image_mode = args.use_static_image_mode
     min_detection_confidence = args.min_detection_confidence
+    min_presence_confidence = args.min_presence_confidence
     min_tracking_confidence = args.min_tracking_confidence
 
     use_brect = True
 
     # カメラ準備 ###############################################################
-    cap = cv.VideoCapture(cap_device)
+    cap = _open_camera(cap_device, use_mac_backend)
+    if use_mac_backend and not cap.isOpened():
+        print(f"Failed to open camera using macOS backend (device {cap_device}).")
+        return
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
 
     # モデルロード #############################################################
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
-        static_image_mode=use_static_image_mode,
-        max_num_hands=1,
-        min_detection_confidence=min_detection_confidence,
+    if not os.path.exists(hand_model_path):
+        print("=" * 70)
+        print("WARNING: Hand landmarker model asset not found!")
+        print(f"Expected path: '{hand_model_path}'")
+        print("")
+        print("Please download the MediaPipe hand landmarker model from:")
+        print("https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker")
+        print("")
+        print("Save the model file as 'hand_landmarker.task' in the 'model/' directory.")
+        print("=" * 70)
+        return
+
+    # Create base options for the hand landmarker
+    base_options = mp_tasks.BaseOptions(model_asset_path=hand_model_path)
+    
+    # Set running mode based on static_image_mode
+    running_mode = (mp_vision.RunningMode.IMAGE if use_static_image_mode 
+                    else mp_vision.RunningMode.VIDEO)
+    
+    # Create hand landmarker options
+    options = mp_vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=running_mode,
+        num_hands=1,
+        min_hand_detection_confidence=min_detection_confidence,
+        min_hand_presence_confidence=min_presence_confidence,
         min_tracking_confidence=min_tracking_confidence,
     )
+    
+    # Create hand landmarker
+    hand_landmarker = mp_vision.HandLandmarker.create_from_options(options)
 
     keypoint_classifier = KeyPointClassifier()
 
@@ -97,6 +156,7 @@ def main():
 
     #  ########################################################################
     mode = 0
+    frame_timestamp_ms = 0
 
     while True:
         fps = cvFpsCalc.get()
@@ -115,16 +175,20 @@ def main():
         debug_image = copy.deepcopy(image)
 
         # 検出実施 #############################################################
-        image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+        image_rgb = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
 
-        image.flags.writeable = False
-        results = hands.process(image)
-        image.flags.writeable = True
+        if use_static_image_mode:
+            detection_result = hand_landmarker.detect(mp_image)
+        else:
+            # Timestamp in milliseconds for video mode
+            detection_result = hand_landmarker.detect_for_video(mp_image, frame_timestamp_ms)
+            frame_timestamp_ms += int(1000 / 30)  # Assume ~30 FPS, increment by ~33ms
 
         #  ####################################################################
-        if results.multi_hand_landmarks is not None:
-            for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
-                                                  results.multi_handedness):
+        if detection_result.hand_landmarks:
+            for hand_landmarks, handedness in zip(detection_result.hand_landmarks,
+                                                  detection_result.handedness):
                 # 外接矩形の計算
                 brect = calc_bounding_rect(debug_image, hand_landmarks)
                 # ランドマークの計算
@@ -199,7 +263,8 @@ def calc_bounding_rect(image, landmarks):
 
     landmark_array = np.empty((0, 2), int)
 
-    for _, landmark in enumerate(landmarks.landmark):
+    # New API: landmarks is a list of NormalizedLandmark objects
+    for landmark in landmarks:
         landmark_x = min(int(landmark.x * image_width), image_width - 1)
         landmark_y = min(int(landmark.y * image_height), image_height - 1)
 
@@ -218,7 +283,8 @@ def calc_landmark_list(image, landmarks):
     landmark_point = []
 
     # キーポイント
-    for _, landmark in enumerate(landmarks.landmark):
+    # New API: landmarks is a list of NormalizedLandmark objects
+    for landmark in landmarks:
         landmark_x = min(int(landmark.x * image_width), image_width - 1)
         landmark_y = min(int(landmark.y * image_height), image_height - 1)
         # landmark_z = landmark.z
@@ -497,7 +563,8 @@ def draw_info_text(image, brect, handedness, hand_sign_text,
     cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[1] - 22),
                  (0, 0, 0), -1)
 
-    info_text = handedness.classification[0].label[0:]
+    # New API: handedness is a Category object with category_name
+    info_text = handedness.category_name[0:] if hasattr(handedness, 'category_name') else 'Unknown'
     if hand_sign_text != "":
         info_text = info_text + ':' + hand_sign_text
     cv.putText(image, info_text, (brect[0] + 5, brect[1] - 4),
